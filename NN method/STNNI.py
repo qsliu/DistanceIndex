@@ -12,7 +12,7 @@ Reference:
 from qgis.PyQt.QtCore import QCoreApplication
 from qgis.PyQt.QtCore import QDate,QDateTime,QTime
 from qgis.core import (QgsProcessing,
-                       QgsFeatureSink,
+                       QgsUnitTypes,
                        QgsProcessingException,
                        QgsProcessingAlgorithm,
                        QgsProcessingParameterFeatureSource,
@@ -22,20 +22,19 @@ from qgis.core import (QgsProcessing,
                        QgsFeatureRequest,
                        QgsProcessingParameterEnum,
                        QgsProcessingParameterNumber,
-                       QgsProcessingParameterCrs,
-                       QgsProcessingParameterDistance,
-                       QgsCoordinateReferenceSystem,
+                       QgsProcessingParameterString,
+                       QgsProcessingParameterBoolean,
                        QgsProject,
                        QgsCoordinateTransform,
                        QgsDistanceArea)
-from qgis import processing
 from rtree import index
-import math,tempfile,os
+import tempfile,os
 import codecs,re
 class STNNIAlgorithm(QgsProcessingAlgorithm):
 
     INPUT_LAYER = 'INPUT_LAYER'
     DATE_FIELD_NAME = 'DATE_FIELD_NAME'
+    DATE_FIELD_FORMAT = "DATE_FIELD_FORMAT"
     OUTPUT_HTML_FILE = 'OUTPUT_HTML_FILE'
     DISTANCE_UNIT = "DISTANCE_UNIT"
     NUM_TIME_UNITS = "NUM_TIME_UNITS"
@@ -43,6 +42,7 @@ class STNNIAlgorithm(QgsProcessingAlgorithm):
     STNNI_OUT = "STNNI_RES"
     CRS = "CRS"
     BASE_LAYER = "BASE_LAYER"
+    BOOL_USE_PRO_CRS = "BOOL_USE_PRO_CRS"
 
 
     def tr(self, string):
@@ -119,10 +119,14 @@ class STNNIAlgorithm(QgsProcessingAlgorithm):
                                                       self.tr('Datetime info field (must in yyyy-mm-dd hh:mm:ss format)'),
                                                       None, self.INPUT_LAYER, QgsProcessingParameterField.String))
 
-        self.addParameter(QgsProcessingParameterDistance(self.DISTANCE_UNIT,self.tr("Distance defined as 1 unit in the calcualtion"), 1,
-                                                         self.CRS, False, 0))
-        # "ProjectCrs" make sure
-        self.addParameter(QgsProcessingParameterCrs(self.CRS, self.tr('Projection used in the calculation'), 'ProjectCrs'))
+        self.addParameter(QgsProcessingParameterString(self.DATE_FIELD_FORMAT,
+                                                       self.tr('Datetime format: e.g., yyyy-mm-dd hh:mm:ss'),optional=True))
+
+        self.addParameter(QgsProcessingParameterNumber(self.DISTANCE_UNIT,
+                                                       self.tr('Define distance unit in meters (How many meters per unit?)'),
+                                                       type=QgsProcessingParameterNumber.Double,
+                                                       minValue=1.0,
+                                                       defaultValue=1.0))
 
         self.addParameter(QgsProcessingParameterNumber(self.NUM_TIME_UNITS,
                                                        self.tr('Number of time unit'), type=QgsProcessingParameterNumber.Double, minValue=0, defaultValue=1))
@@ -131,6 +135,10 @@ class STNNIAlgorithm(QgsProcessingAlgorithm):
                                                      self.tr('Calculation Time Unit'), options=self.time_TIME_UNITS, defaultValue=2))
 
         self.addParameter(QgsProcessingParameterFeatureSource(self.BASE_LAYER, self.tr('Base layer'),[QgsProcessing.TypeVectorPolygon]))
+
+        self.addParameter(QgsProcessingParameterBoolean(self.BOOL_USE_PRO_CRS,
+                                                        self.tr('Use on-the-fly map Projection in calculation'),
+                                                        defaultValue=False))
         self.addParameter(QgsProcessingParameterFileDestination(self.OUTPUT_HTML_FILE, self.tr('Statistics'),
                                                                 self.tr('HTML files (*.html)'), None, True))
 
@@ -189,10 +197,8 @@ class STNNIAlgorithm(QgsProcessingAlgorithm):
             res = None
         return res
 
-    def distance(self,x1,y1,z1, x2,y2,z2):
-        return math.sqrt((x1-x2)**2+(y1-y2)**2+(z1-z2)**2)
-
     def processAlgorithm(self, parameters, context, feedback):
+
         source = self.parameterAsSource(parameters, self.INPUT_LAYER, context)
         if source is None:
             raise QgsProcessingException(self.invalidSourceError(parameters, self.INPUT_LAYER))
@@ -204,10 +210,15 @@ class STNNIAlgorithm(QgsProcessingAlgorithm):
         numDistancePerUnit = self.parameterAsDouble(parameters, self.DISTANCE_UNIT, context)
 
         field_name = self.parameterAsString(parameters, self.DATE_FIELD_NAME, context)
+        self.field_format = self.parameterAsString(parameters,self.DATE_FIELD_FORMAT,context)
+
         fieldidx = source.fields().lookupField(field_name)
 
-        target_crs = self.parameterAsCrs(parameters, self.CRS, context)
         baselayer = self.parameterAsSource(parameters, self.BASE_LAYER, context)
+        baselayer_crs = baselayer.sourceCrs()
+
+        bool_prj_crs = self.parameterAsBoolean(parameters,self.BOOL_USE_PRO_CRS,context)
+
         # Minimum Bounding Rectangular
         output_file = self.parameterAsFileOutput(parameters, self.OUTPUT_HTML_FILE, context)
 
@@ -221,6 +232,7 @@ class STNNIAlgorithm(QgsProcessingAlgorithm):
         # Compute the number of steps to display within the progress bar and
         # get features from source
         total = 100.0 / count if count else 0
+        geoList = {}
         xlist = []
         ylist = []
         zlist = []
@@ -230,8 +242,25 @@ class STNNIAlgorithm(QgsProcessingAlgorithm):
         fids2index = {}
 
         input_crs = source.sourceCrs()
-        if input_crs != target_crs:
-            transtotarget = QgsCoordinateTransform(input_crs,target_crs,QgsProject.instance())
+        prj_crs = QgsProject.instance().crs()
+
+        if bool_prj_crs:
+            if prj_crs.isGeographic():
+                raise QgsProcessingException('Only projection maps are supported now, '
+                                         + 'please set on-the-fly map Projection for the project!')
+        else:
+            # if not use the on-the-fly projection (project projection), and the input point layer have different CRS compare to base layer, then there is an error.
+            if input_crs != baselayer_crs:
+                raise QgsProcessingException(
+                self.tr('Point layer and polygon layer coordinate systems do not coincide \n and the STNNI cannot be calculated.\n'
+                        +'You can solve it by check Use on-the-fly map Projection in calculation!'))
+            else:
+                if input_crs.isGeographic():
+                    raise QgsProcessingException('Only projection maps are supported now, not geographic coordinate systems.'
+                                             + "you could set on-the-fly map Projection for the project or set projection for each layer!")
+        transtotarget = None
+        if bool_prj_crs ==True and input_crs != prj_crs:
+            transtotarget = QgsCoordinateTransform(input_crs,prj_crs,QgsProject.instance())
 
         for current, feature in enumerate(features):
             # Stop the algorithm if cancel button has been clicked
@@ -242,8 +271,9 @@ class STNNIAlgorithm(QgsProcessingAlgorithm):
             fids2index[fid] = current
 
             cur_geo = feature.geometry()
-            if input_crs != target_crs:
+            if transtotarget!=None:
                 cur_geo.transform(transtotarget)
+            geoList[fid] = cur_geo
             xlist.append(cur_geo.asPoint().x())
             ylist.append(cur_geo.asPoint().y())
 
@@ -266,8 +296,6 @@ class STNNIAlgorithm(QgsProcessingAlgorithm):
 
         feedback.pushInfo('Convert space and time coordinate to defined units...')
         basedatetime = zlist[zminidx]
-        xlist = [ele / numDistancePerUnit for ele in xlist]
-        ylist = [ele / numDistancePerUnit for ele in ylist]
         zlist = [self.convertTime(ele,basedatetime,self.time_TIME_UNITS[TimeUnitType],numTimePerUnit) for ele in zlist]
 
         feedback.pushInfo('Construct spatial index...')
@@ -277,37 +305,65 @@ class STNNIAlgorithm(QgsProcessingAlgorithm):
         p.idx_extension = 'index'
         fd = tempfile.gettempdir()
         p.dimension = 3
-        dx3d = index.Index(os.path.join(fd,'3d_index'), properties=p)
+        dx3d = index.Index(os.path.join(fd,'3d_index'), properties=p,overwrite=True)
         for current, f in enumerate(fids):
-            dx3d.insert(f, (xlist[current],ylist[current],zlist[current],xlist[current],ylist[current],zlist[current]))
+            dx3d.insert(f, (xlist[fids2index[f]],ylist[fids2index[f]],zlist[fids2index[f]],
+                            xlist[fids2index[f]],ylist[fids2index[f]],zlist[fids2index[f]]))
 
         feedback.pushInfo('calculate the obseved STNNI...')
         # calculate the obseved NN
         r_obs = 0.0
-        for current,f in enumerate(fids):
-            nn = list(dx3d.nearest((xlist[current],ylist[current],zlist[current],xlist[current],ylist[current],zlist[current]), 2))
-            nn.remove(current)
+        distance = QgsDistanceArea()
+        cur_prj = input_crs
+        if bool_prj_crs and input_crs!=prj_crs:
+            cur_prj = prj_crs
 
-            r_obs += self.distance(xlist[current],ylist[current],zlist[current],
-                                   xlist[fids2index[nn[0]]],ylist[fids2index[nn[0]]],zlist[fids2index[nn[0]]])
+        distance.setSourceCrs(cur_prj, context.transformContext())
+        distance.setEllipsoid(cur_prj.ellipsoidAcronym ())
+
+        o_units = distance.lengthUnits()
+        o2meter_factor = QgsUnitTypes.fromUnitToUnitFactor(o_units, QgsUnitTypes.DistanceMeters)
+
+        for current,f in enumerate(fids):
+            nn = list(dx3d.nearest((xlist[fids2index[f]],ylist[fids2index[f]],zlist[fids2index[f]],
+                                    xlist[fids2index[f]],ylist[fids2index[f]],zlist[fids2index[f]]), 2))
+            nn.remove(f)
+
+            if cur_prj.isGeographic():
+                xydis = distance.measureLine(geoList[f].asPoint(), geoList[nn[0]].asPoint())*o2meter_factor/numDistancePerUnit
+            else:
+                xydis = geoList[f].asPoint().distance(geoList[nn[0]].asPoint()) * o2meter_factor / numDistancePerUnit
+
+            r_obs += (xydis**2 + (zlist[current]-zlist[fids2index[nn[0]]])**2)**(1/2)
+
         r_obs = r_obs/count
 
         # volume calculation
         request = QgsFeatureRequest().setSubsetOfAttributes([])
         features = baselayer.getFeatures(request)
 
-        baselayer_crs = baselayer.sourceCrs()
-        if baselayer_crs != target_crs:
-            transtotarget = QgsCoordinateTransform(baselayer_crs,target_crs,QgsProject.instance())
+
+        if baselayer_crs != prj_crs:
+            trans2 = QgsCoordinateTransform(baselayer_crs,prj_crs,QgsProject.instance())
         da = QgsDistanceArea()
-        da.setSourceCrs(target_crs, context.transformContext())
+        if bool_prj_crs:
+            da.setSourceCrs(prj_crs, context.transformContext())
+            da.setEllipsoid(prj_crs.ellipsoidAcronym())
+        else:
+            da.setSourceCrs(baselayer_crs, context.transformContext())
+            da.setEllipsoid(baselayer_crs.ellipsoidAcronym())
+
         sum_area = 0.0
+        da.areaUnits()
+        o_units = da.areaUnits()
+        o2squaremeter_factor = QgsUnitTypes.fromUnitToUnitFactor(o_units, QgsUnitTypes.AreaSquareMeters)
         for current, f in enumerate(features):
             g = f.geometry()
-            if baselayer_crs != target_crs:
-                g.transform(transtotarget)
-            g_area = da.measureArea(g)
+            if bool_prj_crs==True and baselayer_crs != prj_crs:
+                g.transform(trans2)
+            g_area = da.measureArea(g) * o2squaremeter_factor
             sum_area += g_area / numDistancePerUnit / numDistancePerUnit
+
         # calculate theory NN
         z_max = max(zlist)
         volume = sum_area * z_max
@@ -322,6 +378,8 @@ class STNNIAlgorithm(QgsProcessingAlgorithm):
 
         feedback.pushInfo('Printing output STNNI...\n\n')
         data = []
+        data.append(self.tr('Python command \n{}').format(self.asPythonCommand(parameters,context)))
+        data.append(self.tr('Point layer: {}').format(source))
         data.append(self.tr('Time information field: {}').format(field_name))
         data.append(self.tr('Space-time Nearest Neighborhood Index:  {}').format(res))
         data.append(self.tr('r_obs:  {}').format(r_obs))

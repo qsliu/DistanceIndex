@@ -106,7 +106,7 @@ class NNIAlgorithm(QgsProcessingAlgorithm):
             )
         )
 
-        self.addParameter(QgsProcessingParameterDistance(self.DISTANCE_UNIT,self.tr("Distance defined as 1 unit in the calcualtion"), 1,
+        self.addParameter(QgsProcessingParameterDistance(self.DISTANCE_UNIT,self.tr("Define distance unit in meters (How many meters per unit?)"), 1,
                                                          self.CRS, False, 0))
         # "ProjectCrs" make sure
         self.addParameter(QgsProcessingParameterCrs(self.CRS, self.tr('Projection used in the calculation'), 'ProjectCrs'))
@@ -147,7 +147,7 @@ class NNIAlgorithm(QgsProcessingAlgorithm):
         distance.setEllipsoid(context.ellipsoid())
 
         # calculate the obseved NN
-        request = QgsFeatureRequest().setSubsetOfAttributes([])
+        request = QgsFeatureRequest().setSubsetOfAttributes([]).setDestinationCrs(target_crs, context.transformContext())
         features = source.getFeatures(request)
         count = source.featureCount()
         r_obs = 0.0
@@ -156,7 +156,6 @@ class NNIAlgorithm(QgsProcessingAlgorithm):
             if feedback.isCanceled():
                 break
             src = f.geometry().boundingBox().center()
-
             neighbors = index.nearestNeighbor(src, 2)
             neighbors.remove(f.id())
             ft = next(source.getFeatures(
